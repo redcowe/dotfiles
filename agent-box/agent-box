@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+show_help() {
+  cat <<'HELP'
+Usage:
+  agent-box [--help | -h | help]
+  agent-box [COMMAND [ARG...]]
+
+Run a command inside the local-agent-sandbox Docker container.
+The current project is mounted read/write at /workspace.
+
+Options:
+  --help, -h, help  Show this help and exit without checking Docker or mounting files.
+
+Environment:
+  EXTRA_DIRS          Optional whitespace-separated repository paths. Each path
+                      must be an existing directory beneath your home and
+                      outside protected directories. Paths with spaces are
+                      unsupported; duplicate /repos mount names are skipped.
+  OPENAI_API_KEY      Passed into the container when set.
+  OPENROUTER_API_KEY  Passed into the container when set.
+  PLAYWRIGHT_BROWSERS_PATH  Fixed to the persistent Playwright browser-cache volume.
+
+The container has outbound network access. Protected host paths, including
+~/.ssh, ~/.aws, ~/.config, ~/.local, and ~/.agent-sandbox, are not mounted.
+
+Examples:
+  cd ~/src/my-project
+  agent-box bash
+  EXTRA_DIRS="../backend ../shared" agent-box codex
+HELP
+}
+
+case "${1:-}" in
+  --help|-h|help)
+    show_help
+    exit 0
+    ;;
+esac
+
+IMAGE_NAME="local-agent-sandbox:latest"
+SANDBOX_DIR="$HOME/.agent-sandbox"
+HOME_REAL="$(cd -- "$HOME" && pwd -P)"
+PROJECT_DIR="$(pwd -P)"
+PROJECT_NAME="$(basename "$PROJECT_DIR")"
+
+is_within_home() {
+  [[ "$1" == "$HOME_REAL/"* ]]
+}
+
+is_protected_path() {
+  local candidate="$1"
+  local root protected
+
+  for root in .ssh .aws .config .local .agent-sandbox; do
+    protected="$HOME_REAL/$root"
+    if [[ -d "$protected" ]]; then
+      protected="$(cd -- "$protected" && pwd -P)"
+    fi
+    if [[ "$candidate" == "$protected" || "$candidate" == "$protected/"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Require a project directory strictly beneath the canonical WSL Linux home.
+if ! is_within_home "$PROJECT_DIR"; then
+  echo "Error: Refusing to mount $PROJECT_DIR. Use a project directory beneath $HOME."
+  exit 1
+fi
+if [[ "$PROJECT_DIR" == /mnt/* ]]; then
+  echo "Error: Refusing to mount Windows paths. Use a project directory in the WSL Linux home."
+  exit 1
+fi
+if is_protected_path "$PROJECT_DIR"; then
+  echo "Error: Refusing to mount protected path $PROJECT_DIR."
+  exit 1
+fi
+
+# Optional extra repositories: EXTRA_DIRS="../backend ../shared" agent-box ...
+# EXTRA_DIRS is whitespace-separated; paths containing spaces are unsupported.
+# read splits whitespace but does not perform shell pathname expansion.
+EXTRA_DIRS_ARRAY=()
+while IFS= read -r line; do
+  line_dirs=()
+  if [[ "$line" =~ [^[:space:]] ]]; then
+    read -r -a line_dirs <<< "$line"
+    EXTRA_DIRS_ARRAY+=("${line_dirs[@]}")
+  fi
+done < <(printf '%s\n' "${EXTRA_DIRS:-}")
+
+EXTRA_MOUNTS=()
+HAS_EXTRA_MOUNTS=false
+MOUNT_TARGETS=()
+for dir in "${EXTRA_DIRS_ARRAY[@]-}"; do
+  [[ -n "$dir" ]] || continue
+  if [[ ! -d "$dir" ]]; then
+    echo "Warning: EXTRA_DIRS path '$dir' is not an existing directory; skipping."
+    continue
+  fi
+  if ! ABS_DIR="$(cd -- "$dir" 2>/dev/null && pwd -P)"; then
+    echo "Warning: EXTRA_DIRS path '$dir' could not be resolved; skipping."
+    continue
+  fi
+  if [[ "$ABS_DIR" == /mnt/* ]]; then
+    echo "Warning: EXTRA_DIRS path '$dir' resolves to a Windows mount; skipping."
+    continue
+  fi
+  if ! is_within_home "$ABS_DIR"; then
+    echo "Warning: EXTRA_DIRS path '$dir' resolves outside $HOME; skipping."
+    continue
+  fi
+  if is_protected_path "$ABS_DIR"; then
+    echo "Warning: EXTRA_DIRS path '$dir' resolves to protected path $ABS_DIR; skipping."
+    continue
+  fi
+  if [[ "$ABS_DIR" == "$PROJECT_DIR" ]]; then
+    echo "Warning: EXTRA_DIRS path '$dir' resolves to the project already mounted at /workspace; skipping."
+    continue
+  fi
+
+  DIR_NAME="$(basename "$ABS_DIR")"
+  TARGET="/repos/$DIR_NAME"
+  DUPLICATE_TARGET=false
+  for existing_target in "${MOUNT_TARGETS[@]-}"; do
+    if [[ "$existing_target" == "$TARGET" ]]; then
+      DUPLICATE_TARGET=true
+      break
+    fi
+  done
+  if [[ "$DUPLICATE_TARGET" == true ]]; then
+    echo "Warning: EXTRA_DIRS path '$dir' conflicts with an existing mount target $TARGET; skipping."
+    continue
+  fi
+  MOUNT_TARGETS+=("$TARGET")
+  EXTRA_MOUNTS+=(-v "$ABS_DIR:$TARGET")
+  HAS_EXTRA_MOUNTS=true
+done
+
+# Allocate -t only when stdin is a TTY so automated runs work.
+TTY_FLAGS=(-i)
+if [[ -t 0 ]]; then
+  TTY_FLAGS=(-it)
+fi
+
+# Auto-build locally if the image does not exist yet.
+if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  echo "Building $IMAGE_NAME locally from $SANDBOX_DIR..."
+  docker build -t "$IMAGE_NAME" "$SANDBOX_DIR"
+fi
+
+DOCKER_RUN_ARGS=(--rm "${TTY_FLAGS[@]}" --init --name "agent-${PROJECT_NAME}-$$" --security-opt=no-new-privileges -v "$PROJECT_DIR:/workspace")
+if [[ "$HAS_EXTRA_MOUNTS" == true ]]; then
+  DOCKER_RUN_ARGS+=("${EXTRA_MOUNTS[@]}")
+fi
+DOCKER_RUN_ARGS+=(-v "agent-codex-auth:/home/node/.codex" -v "agent-opencode-cfg:/home/node/.config/opencode" -v "agent-opencode-data:/home/node/.local/share/opencode" -v "agent-playwright-browsers:/home/node/.cache/ms-playwright" -e OPENAI_API_KEY -e OPENROUTER_API_KEY -e PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright "$IMAGE_NAME" "$@")
+exec docker run "${DOCKER_RUN_ARGS[@]}"
