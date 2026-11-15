@@ -5,13 +5,29 @@ show_help() {
   cat <<'HELP'
 Usage:
   agent-box [--help | -h | help]
+  agent-box [--port PORT ...] [COMMAND [ARG...]]
   agent-box [COMMAND [ARG...]]
+  agent-box expose CONTAINER_PORT [--host-port HOST_PORT] [--container NAME|ID]
+  agent-box unexpose HOST_PORT
+  agent-box forwards
 
 Run a command inside the local-agent-sandbox Docker container.
 The current project is mounted read/write at /workspace.
 
 Options:
   --help, -h, help  Show this help and exit without checking Docker or mounting files.
+  --port, -p PORT   Publish PORT on host loopback to the same container port.
+                    Repeat to publish multiple ports. The server must listen on
+                    0.0.0.0 inside the container.
+
+Live container forwarding:
+  expose            Forward a port from an already running container to localhost.
+                    Defaults to the current project's agent-box container; use
+                    --container when selecting another container or when several
+                    project containers are running. The host port defaults to
+                    the container port.
+  unexpose          Stop a live forward by its host port.
+  forwards          List active live forwards.
 
 Environment:
   EXTRA_DIRS          Optional whitespace-separated repository paths. Each path
@@ -28,6 +44,10 @@ The container has outbound network access. Protected host paths, including
 Examples:
   cd ~/src/my-project
   agent-box bash
+  agent-box --port 3000 npm run dev
+  agent-box expose 3000
+  agent-box expose 8080 --container my-database
+  agent-box unexpose 3000
   EXTRA_DIRS="../backend ../shared" agent-box codex
 HELP
 }
@@ -38,6 +58,49 @@ case "${1:-}" in
     exit 0
     ;;
 esac
+
+case "${1:-}" in
+  expose|unexpose|forwards)
+    FORWARDER="$HOME/.local/bin/agent-box-port-forward"
+    if [[ ! -x "$FORWARDER" ]]; then
+      echo "Error: Port forwarding helper is missing. Reinstall agent-box from the dotfiles package." >&2
+      exit 1
+    fi
+    exec "$FORWARDER" "$@"
+    ;;
+esac
+
+PORT_FLAGS=()
+HAS_PORTS=false
+while (($#)); do
+  case "$1" in
+    --port|-p)
+      if (($# < 2)); then
+        echo "Error: $1 requires a port number." >&2
+        exit 2
+      fi
+      if [[ ! "$2" =~ ^[0-9]{1,5}$ ]]; then
+        echo "Error: Invalid port '$2'; expected a number from 1 to 65535." >&2
+        exit 2
+      fi
+      PORT_NUMBER=$((10#$2))
+      if ((PORT_NUMBER < 1 || PORT_NUMBER > 65535)); then
+        echo "Error: Invalid port '$2'; expected a number from 1 to 65535." >&2
+        exit 2
+      fi
+      PORT_FLAGS+=(-p "127.0.0.1:$PORT_NUMBER:$PORT_NUMBER")
+      HAS_PORTS=true
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 IMAGE_NAME="local-agent-sandbox:latest"
 SANDBOX_DIR="$HOME/.agent-sandbox"
@@ -152,6 +215,9 @@ if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
 fi
 
 DOCKER_RUN_ARGS=(--rm "${TTY_FLAGS[@]}" --init --name "agent-${PROJECT_NAME}-$$" --security-opt=no-new-privileges -v "$PROJECT_DIR:/workspace")
+if [[ "$HAS_PORTS" == true ]]; then
+  DOCKER_RUN_ARGS+=("${PORT_FLAGS[@]}")
+fi
 if [[ "$HAS_EXTRA_MOUNTS" == true ]]; then
   DOCKER_RUN_ARGS+=("${EXTRA_MOUNTS[@]}")
 fi

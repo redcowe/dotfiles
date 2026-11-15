@@ -5,7 +5,8 @@ usage() {
   cat <<'HELP'
 Usage: install.sh [--rebuild]
 
-Install the agent-box launcher and Dockerfile into the current user's home.
+Install the agent-box launcher, forwarding helper, and Dockerfile into the
+current user's home.
 Load a bundled local-agent-sandbox image archive when present. If there is no
 archive, build the image only when it is missing.
 
@@ -35,6 +36,7 @@ esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_LAUNCHER="$SCRIPT_DIR/agent-box"
+SOURCE_FORWARDER="$SCRIPT_DIR/agent-box-port-forward"
 SOURCE_DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 IMAGE_ARCHIVE="$SCRIPT_DIR/local-agent-sandbox.tar.gz"
 SANDBOX_DIR="$HOME/.agent-sandbox"
@@ -49,19 +51,24 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "Error: Docker CLI is not installed." >&2
   exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: Python 3 is required for live port forwarding." >&2
+  exit 1
+fi
 if ! docker version >/dev/null 2>&1; then
   echo "Error: Docker is not accessible from this shell." >&2
   echo "Open a WSL session with Docker access, then rerun this installer." >&2
   exit 1
 fi
-if [[ ! -f "$SOURCE_LAUNCHER" || ! -f "$SOURCE_DOCKERFILE" ]]; then
-  echo "Error: installer needs agent-box and Dockerfile beside install.sh." >&2
+if [[ ! -f "$SOURCE_LAUNCHER" || ! -f "$SOURCE_FORWARDER" || ! -f "$SOURCE_DOCKERFILE" ]]; then
+  echo "Error: installer needs agent-box, agent-box-port-forward, and Dockerfile beside install.sh." >&2
   exit 1
 fi
 
 mkdir -p "$SANDBOX_DIR" "$BIN_DIR"
 install -m 0644 "$SOURCE_DOCKERFILE" "$SANDBOX_DIR/Dockerfile"
 install -m 0755 "$SOURCE_LAUNCHER" "$BIN_DIR/agent-box"
+install -m 0755 "$SOURCE_FORWARDER" "$BIN_DIR/agent-box-port-forward"
 
 touch "$HOME/.bashrc"
 if ! grep -Fq 'HOME/.local/bin' "$HOME/.bashrc"; then
@@ -80,6 +87,7 @@ fi
 
 docker image inspect "$IMAGE_NAME" >/dev/null
 echo "Installed $BIN_DIR/agent-box"
+echo "Installed $BIN_DIR/agent-box-port-forward"
 echo "Dockerfile: $SANDBOX_DIR/Dockerfile"
 echo "Image: $IMAGE_NAME"
 echo "Open a new shell or run: source $HOME/.bashrc"

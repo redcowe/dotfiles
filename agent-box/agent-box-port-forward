@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""Host-side, localhost-only TCP forwarding for live Docker containers."""
+
+import argparse
+import asyncio
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+STATE_DIR = Path.home() / ".agent-sandbox" / "forwards"
+
+
+def port_number(value):
+    try:
+        port = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if port < 1 or port > 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def docker(*args):
+    try:
+        result = subprocess.run(
+            ["docker", *args], check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("Docker CLI was not found") from error
+    if result.returncode:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(message or "Docker command failed")
+    return result.stdout.strip()
+
+
+def inspect_target(selector):
+    template = (
+        "{{.Id}}|{{.Name}}|{{.State.Running}}|"
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}"
+    )
+    output = docker("inspect", "--format", template, selector)
+    fields = output.split("|", 3)
+    if len(fields) != 4:
+        raise RuntimeError(f"Could not inspect container {selector!r}")
+    container_id, container_name, running, ip_addresses = fields
+    if running != "true":
+        raise RuntimeError(f"Container {container_name.lstrip('/')} is not running")
+    target_ip = next((value for value in ip_addresses.split() if value), None)
+    if not target_ip:
+        raise RuntimeError(
+            f"Container {container_name.lstrip('/')} has no bridge-network IP"
+        )
+    return {
+        "container_id": container_id,
+        "container_name": container_name.lstrip("/"),
+        "target_ip": target_ip,
+    }
+
+
+def choose_target(selector):
+    if selector:
+        return inspect_target(selector)
+
+    project_name = Path.cwd().resolve().name
+    prefix = f"agent-{project_name}-"
+    rows = docker(
+        "ps",
+        "--filter",
+        "status=running",
+        "--format",
+        "{{.ID}}|{{.Names}}",
+    ).splitlines()
+    matches = []
+    for row in rows:
+        fields = row.split("|", 1)
+        if len(fields) == 2 and fields[1].startswith(prefix):
+            matches.append((fields[0], fields[1]))
+
+    if not matches:
+        raise RuntimeError(
+            f"No running agent-box container found for project {project_name!r}; "
+            "pass --container NAME or ID"
+        )
+    if len(matches) > 1:
+        names = ", ".join(name for _, name in matches)
+        raise RuntimeError(
+            f"Multiple running containers match this project ({names}); "
+            "pass --container NAME or ID"
+        )
+    return inspect_target(matches[0][0])
+
+
+def state_path(host_port):
+    return STATE_DIR / f"{host_port}.json"
+
+
+def read_state(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def forwarder_is_running(pid):
+    try:
+        os.kill(pid, 0)
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return False
+    return (
+        os.fsencode(str(SCRIPT_PATH)) in command_line
+        and b"_serve" in command_line
+    )
+
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)
+
+
+def expose(args):
+    host_port = args.host_port or args.container_port
+    target = choose_target(args.container)
+    path = state_path(host_port)
+    ensure_state_dir()
+
+    existing = read_state(path) if path.exists() else None
+    if existing and forwarder_is_running(int(existing.get("pid", -1))):
+        same_target = (
+            existing.get("container_id") == target["container_id"]
+            and existing.get("container_port") == args.container_port
+        )
+        if same_target:
+            print(
+                f"Already forwarding 127.0.0.1:{host_port} to "
+                f"{target['container_name']}:{args.container_port}"
+            )
+            return 0
+        raise RuntimeError(
+            f"Host port {host_port} is already forwarded; run "
+            f"agent-box unexpose {host_port} first"
+        )
+    if path.exists():
+        path.unlink()
+
+    state = {
+        "host_port": host_port,
+        "container_port": args.container_port,
+        **target,
+    }
+    log_path = STATE_DIR / f"{host_port}.log"
+    command = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        "_serve",
+        "--host-port",
+        str(host_port),
+        "--target-port",
+        str(args.container_port),
+        "--target-host",
+        target["target_ip"],
+        "--container-id",
+        target["container_id"],
+        "--container-name",
+        target["container_name"],
+        "--state-file",
+        str(path),
+    ]
+
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+        )
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        started = read_state(path) if path.exists() else None
+        if started and started.get("pid") == process.pid:
+            print(
+                f"Forwarding 127.0.0.1:{host_port} to "
+                f"{target['container_name']}:{args.container_port} "
+                f"({target['target_ip']})"
+            )
+            print(f"Stop it with: agent-box unexpose {host_port}")
+            return 0
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    details = log_path.read_text(errors="replace") if log_path.exists() else ""
+    if path.exists():
+        path.unlink()
+    raise RuntimeError(
+        f"Could not start forwarding on 127.0.0.1:{host_port}. "
+        f"Check whether the port is already in use. {details.strip()}"
+    )
+
+
+async def relay(reader, writer):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+    try:
+        writer.write_eof()
+        await writer.drain()
+    except (AttributeError, ConnectionError, OSError, RuntimeError):
+        pass
+
+
+async def handle_client(client_reader, client_writer, target_host, target_port):
+    upstream_writer = None
+    try:
+        upstream_reader, upstream_writer = await asyncio.wait_for(
+            asyncio.open_connection(target_host, target_port), timeout=5
+        )
+        await asyncio.gather(
+            relay(client_reader, upstream_writer),
+            relay(upstream_reader, client_writer),
+        )
+    except (ConnectionError, OSError, asyncio.TimeoutError) as error:
+        print(f"Forward target unavailable: {error}", file=sys.stderr, flush=True)
+    finally:
+        client_writer.close()
+        await client_writer.wait_closed()
+        if upstream_writer is not None:
+            upstream_writer.close()
+            await upstream_writer.wait_closed()
+
+
+async def watch_container(container_id, stop_event):
+    while not stop_event.is_set():
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                container_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            output, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            if process.returncode != 0 or output.decode().strip() != "true":
+                print("Target container stopped; closing forwarder.", flush=True)
+                stop_event.set()
+                return
+        except (OSError, asyncio.TimeoutError):
+            print("Docker target is unavailable; closing forwarder.", flush=True)
+            stop_event.set()
+            return
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def serve(args):
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+
+    server = await asyncio.start_server(
+        lambda reader, writer: handle_client(
+            reader, writer, args.target_host, args.target_port
+        ),
+        host="127.0.0.1",
+        port=args.host_port,
+    )
+    state = {
+        "pid": os.getpid(),
+        "host_port": args.host_port,
+        "container_port": args.target_port,
+        "container_id": args.container_id,
+        "container_name": args.container_name,
+        "target_host": args.target_host,
+    }
+    temporary_path = args.state_file.with_suffix(f".{os.getpid()}.tmp")
+    temporary_path.write_text(json.dumps(state))
+    temporary_path.replace(args.state_file)
+    print(
+        f"Listening on 127.0.0.1:{args.host_port}, forwarding to "
+        f"{args.target_host}:{args.target_port}",
+        flush=True,
+    )
+
+    monitor = asyncio.create_task(watch_container(args.container_id, stop_event))
+    try:
+        await stop_event.wait()
+    finally:
+        server.close()
+        await server.wait_closed()
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+        current = read_state(args.state_file)
+        if current and current.get("pid") == os.getpid():
+            args.state_file.unlink(missing_ok=True)
+
+
+def unexpose(host_port):
+    path = state_path(host_port)
+    state = read_state(path) if path.exists() else None
+    if not state:
+        raise RuntimeError(f"No active forward is recorded for host port {host_port}")
+    pid = int(state.get("pid", -1))
+    if forwarder_is_running(pid):
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and forwarder_is_running(pid):
+            time.sleep(0.1)
+        if forwarder_is_running(pid):
+            os.kill(pid, signal.SIGKILL)
+    path.unlink(missing_ok=True)
+    print(f"Stopped forwarding on 127.0.0.1:{host_port}")
+
+
+def list_forwards():
+    ensure_state_dir()
+    found = False
+    for path in sorted(STATE_DIR.glob("*.json")):
+        state = read_state(path)
+        if not state:
+            path.unlink(missing_ok=True)
+            continue
+        pid = int(state.get("pid", -1))
+        if not forwarder_is_running(pid):
+            path.unlink(missing_ok=True)
+            continue
+        found = True
+        print(
+            f"127.0.0.1:{state['host_port']} -> "
+            f"{state.get('container_name', state.get('container_id', 'unknown')[:12])}:"
+            f"{state['container_port']} "
+            f"({state['target_host']})"
+        )
+    if not found:
+        print("No active agent-box forwards.")
+
+
+def make_parser():
+    parser = argparse.ArgumentParser(prog="agent-box")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    expose_parser = commands.add_parser(
+        "expose", help="forward a live container port to localhost"
+    )
+    expose_parser.add_argument("container_port", type=port_number)
+    expose_parser.add_argument("--host-port", type=port_number)
+    expose_parser.add_argument(
+        "--container", help="running container name or ID; defaults to this project"
+    )
+
+    unexpose_parser = commands.add_parser(
+        "unexpose", help="stop a localhost forward by host port"
+    )
+    unexpose_parser.add_argument("host_port", type=port_number)
+
+    commands.add_parser("forwards", help="list active localhost forwards")
+
+    serve_parser = commands.add_parser("_serve", help=argparse.SUPPRESS)
+    serve_parser.add_argument("--host-port", type=port_number, required=True)
+    serve_parser.add_argument("--target-port", type=port_number, required=True)
+    serve_parser.add_argument("--target-host", required=True)
+    serve_parser.add_argument("--container-id", required=True)
+    serve_parser.add_argument("--container-name", required=True)
+    serve_parser.add_argument("--state-file", type=Path, required=True)
+
+    return parser
+
+
+def main():
+    parser = make_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "expose":
+            return expose(args)
+        if args.command == "unexpose":
+            unexpose(args.host_port)
+            return 0
+        if args.command == "forwards":
+            list_forwards()
+            return 0
+        if args.command == "_serve":
+            asyncio.run(serve(args))
+            return 0
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
