@@ -2,7 +2,7 @@ FROM node:22-bookworm
 
 # Core development utilities and Playwright Chromium runtime dependencies for Debian 12.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ripgrep fd-find jq python3 python3-pip python3-venv \
+    git curl ripgrep fd-find jq sqlite3 python3 python3-pip python3-venv \
     fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
     xfonts-scalable fonts-liberation fonts-ipafont-gothic fonts-wqy-zenhei \
     fonts-tlwg-loma-otf fonts-freefont-ttf xvfb \
